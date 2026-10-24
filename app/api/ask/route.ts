@@ -116,6 +116,14 @@ ${heard?.recent ? heard.recent.slice(0, 2000) + "\n" : ""}>>> "${current}"   <--
     }
   } catch (e) {
     console.error(e);
-    return NextResponse.json({ reply: "Sorry, I lost my place for a second. Could you ask me again?", action: "stay_paused", sceneIndex: null });
+    // A preview deployment is access-controlled by Vercel, so surface the
+    // provider's safe error message there to make setup problems diagnosable.
+    // Keep production's listener-friendly fallback unchanged.
+    const detail = process.env.VERCEL_ENV === "preview" && e instanceof Error ? ` (${e.message.slice(0, 300)})` : "";
+    return NextResponse.json({
+      reply: `Sorry, I lost my place for a second. Could you ask me again?${detail}`,
+      action: "stay_paused",
+      sceneIndex: null,
+    });
   }
 }
