@@ -1,8 +1,21 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { cleanWord, paragraphStart, sentenceRange, sentenceText, tokenAt, type Book, type Mode } from "@/lib/book";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  DEFAULT_NARRATOR,
+  NARRATOR_VOICES,
+  cleanWord,
+  joinTokens,
+  paragraphStart,
+  sentenceRange,
+  sentenceText,
+  tokenAt,
+  type Book,
+  type Mode,
+  type Track,
+  type VoiceTracks,
+} from "@/lib/book";
 import { MicIcon, NextIcon, PauseIcon, PlayIcon, PrevIcon, ReplayIcon, StopIcon } from "./icons";
 import { Stage } from "./Stage";
 import { Caption, Transcript } from "./Transcript";
@@ -15,6 +28,10 @@ const RATES = [0.75, 1, 1.25];
 const SILENT = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAACAgICA";
 
 type Action = { reply: string; action: string; sceneIndex?: number | null };
+/** Where a tutor action applies: scene, mode, and the narration time it refers to. */
+type Ctx = { i: number; m: Mode; t: number; anchored?: boolean };
+// A question asked this soon after an automatic scene change is probably about the previous scene.
+const BOUNDARY_SECS = 6;
 type Pop = { i: number; word: string; sentence: string; rect: DOMRect; def: Definition | null };
 
 export function Player({ book }: { book: Book }) {
@@ -30,6 +47,10 @@ export function Player({ book }: { book: Book }) {
   const [cinema, setCinema] = useState(false);
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [pop, setPop] = useState<Pop | null>(null);
+  const [narrator, setNarrator] = useState<string>(DEFAULT_NARRATOR);
+  const [tutorVoice, setTutorVoice] = useState<string>("coral"); // or "same"
+  const [voiceTracks, setVoiceTracks] = useState<Record<string, VoiceTracks>>({});
+  const [audioIssue, setAudioIssue] = useState(false);
 
   const pending = useRef<{ t: number; play: boolean } | null>(null);
   const advanceTimer = useRef<number | undefined>(undefined);
@@ -40,9 +61,23 @@ export function Player({ book }: { book: Book }) {
   const lastTok = useRef(-2);
   const tutorUnlocked = useRef(false);
   const titled = useRef(new Set<string>()); // chapter title cards already shown
+  const lastAuto = useRef<{ from: number; to: number } | null>(null); // last automatic scene change
+  const deferredAction = useRef<(() => void) | null>(null); // tutor action to run on ▶ if its voice failed
 
   const scene = book.scenes[sceneIdx];
-  const track = scene[mode];
+  // Narration for the selected voice (same text/tokens as book.json, different audio + timings).
+  const trackFor = useCallback(
+    (i: number, m: Mode, voice = narrator, vt = voiceTracks): Track => {
+      const base = book.scenes[i][m];
+      const v = voice !== DEFAULT_NARRATOR ? vt[voice]?.[book.scenes[i].id]?.[m] : undefined;
+      return v ? { ...base, ...v } : base;
+    },
+    [book, narrator, voiceTracks],
+  );
+  const track = useMemo(() => trackFor(sceneIdx, mode), [trackFor, sceneIdx, mode]);
+  const trackRef = useRef(track);
+  trackRef.current = track;
+  const tutorVoiceId = tutorVoice === "same" ? narrator : tutorVoice;
   const current = tokenAt(track.tokens, time);
   const started = status !== "idle" || time > 0;
   const isChapterStart = sceneIdx === 0 || book.scenes[sceneIdx - 1].chapter !== scene.chapter;
@@ -63,15 +98,40 @@ export function Player({ book }: { book: Book }) {
       setRate(saved.rate ?? 1);
       setLang(saved.lang ?? "English");
       setCinema(!!saved.cinema);
-      go(i, m, saved.time ?? 0, false);
+      if (saved.tutorVoice) setTutorVoice(saved.tutorVoice);
+      const restore = (vt: Record<string, VoiceTracks>, voice: string) => {
+        setVoiceTracks(vt);
+        setNarrator(voice);
+        setSceneIdx(i);
+        setMode(m);
+        setTime(saved.time ?? 0);
+        pending.current = { t: saved.time ?? 0, play: false };
+        const a = narr.current;
+        if (a && a.readyState >= 1 && a.src.endsWith(trackFor(i, m, voice, vt).audio)) {
+          a.currentTime = saved.time ?? 0;
+          pending.current = null;
+        }
+      };
+      const v = NARRATOR_VOICES.some((x) => x.id === saved.narrator) ? saved.narrator : DEFAULT_NARRATOR;
+      if (v === DEFAULT_NARRATOR) restore({}, v);
+      else
+        loadVoice(v)
+          .then((t) => restore({ [v]: t }, v))
+          .catch(() => restore({}, DEFAULT_NARRATOR));
     } catch {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => {
     try {
-      localStorage.setItem(storeKey, JSON.stringify({ sceneIdx, mode, time, rate, lang, cinema }));
+      localStorage.setItem(storeKey, JSON.stringify({ sceneIdx, mode, time, rate, lang, cinema, narrator, tutorVoice }));
     } catch {}
-  }, [storeKey, sceneIdx, mode, time, rate, lang, cinema]);
+  }, [storeKey, sceneIdx, mode, time, rate, lang, cinema, narrator, tutorVoice]);
+
+  const loadVoice = async (v: string): Promise<VoiceTracks> => {
+    const r = await fetch(`/books/${book.id}/tracks/${v}.json`);
+    if (!r.ok) throw new Error("voice");
+    return r.json();
+  };
 
   useEffect(() => {
     if (time >= 5) titled.current.add(scene.id);
@@ -149,8 +209,11 @@ export function Player({ book }: { book: Book }) {
   /** Jump to (scene, mode, time). Works whether or not the audio source changes. */
   const go = (i: number, m: Mode, t: number, autoplay: boolean) => {
     clearTimeout(advanceTimer.current);
+    lastAuto.current = null;
+    deferredAction.current = null;
+    setAudioIssue(false);
     const a = narr.current;
-    const target = book.scenes[i][m].audio;
+    const target = trackFor(i, m).audio;
     t = Math.max(0, t);
     lastTok.current = -2;
     setTime(t);
@@ -176,21 +239,32 @@ export function Player({ book }: { book: Book }) {
     const a = narr.current!;
     const p = pending.current;
     a.playbackRate = rate;
-    if (!p) return;
+    if (!p || !a.src.endsWith(trackRef.current.audio)) return; // ignore a stale source
     pending.current = null;
     a.currentTime = p.t;
     if (p.play) play();
   };
 
+  // If a source swap left a pending seek on audio that's already loaded, apply it now.
+  useEffect(() => {
+    const a = narr.current;
+    if (a && pending.current && a.readyState >= 1 && a.src.endsWith(track.audio)) onLoadedMetadata();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [track.audio]);
+
   const onEnded = () => {
     if (statusRef.current !== "playing") return;
     if (sceneIdx < book.scenes.length - 1) {
-      advanceTimer.current = window.setTimeout(() => go(sceneIdx + 1, mode, 0, true), 900);
+      const from = sceneIdx;
+      advanceTimer.current = window.setTimeout(() => {
+        go(from + 1, mode, 0, true);
+        lastAuto.current = { from, to: from + 1 };
+      }, 1500);
     } else setStatus("finished");
   };
 
   const sentenceStartTime = (m: Mode, t: number) => {
-    const toks = scene[m].tokens;
+    const toks = trackFor(sceneIdx, m).tokens;
     const ci = Math.max(0, tokenAt(toks, t));
     return toks[sentenceRange(toks, ci)[0]]?.s ?? 0;
   };
@@ -198,36 +272,76 @@ export function Player({ book }: { book: Book }) {
   const switchMode = (m: Mode, autoplay: boolean) => {
     const t = narr.current?.currentTime ?? time;
     const p = track.tokens[Math.max(0, tokenAt(track.tokens, t))]?.p ?? 0;
-    go(sceneIdx, m, paragraphStart(scene[m].tokens, p), autoplay);
+    go(sceneIdx, m, paragraphStart(trackFor(sceneIdx, m).tokens, p), autoplay);
+  };
+
+  const changeNarrator = async (v: string) => {
+    let vt = voiceTracks;
+    if (v !== DEFAULT_NARRATOR && !vt[v]) {
+      try {
+        vt = { ...vt, [v]: await loadVoice(v) };
+      } catch {
+        return alert("That voice isn't available yet.");
+      }
+    }
+    // Same words, different timings: keep the listener on the same word.
+    const a = narr.current;
+    const wasPlaying = statusRef.current === "playing";
+    const t = a?.currentTime ?? time;
+    const next = trackFor(sceneIdx, mode, v, vt);
+    const t2 = t > 0 ? (next.tokens[Math.max(0, tokenAt(track.tokens, t))]?.s ?? 0) : 0;
+    a?.pause();
+    pending.current = { t: t2, play: wasPlaying };
+    lastTok.current = -2;
+    setVoiceTracks(vt);
+    setNarrator(v);
+    setTime(t2);
+  };
+
+  /** "Read from here": continue the narration from token i of the current track. */
+  const readFrom = (i: number) => {
+    setPop(null);
+    stopTutor();
+    go(sceneIdx, mode, (track.tokens[i]?.s ?? 0) - 0.05, true);
   };
 
   // ---------- tutor ----------
+  /**
+   * Speak a tutor reply by streaming /api/tts straight into the <audio> element.
+   * Resolves true when finished (or skipped), false if the audio never started or broke.
+   */
   const speak = (text: string) =>
-    new Promise<void>((resolve) => {
+    new Promise<boolean>((resolve) => {
       setStatus("speaking");
-      speakDone.current = resolve;
-      (async () => {
-        try {
-          const r = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
-          if (!r.ok) throw new Error("tts");
-          const url = URL.createObjectURL(await r.blob());
-          const tu = tutor.current!;
-          if (speakDone.current !== resolve) return; // interrupted while loading
-          tu.src = url;
-          tu.onended = () => {
-            URL.revokeObjectURL(url);
-            resolve();
-          };
-          tu.onerror = () => resolve();
-          await tu.play();
-        } catch {
-          setTimeout(resolve, 1500); // reply is still visible in the chat
-        }
-      })();
+      const tu = tutor.current!;
+      const timers: number[] = [];
+      let done = false;
+      const finish = (ok: boolean) => {
+        if (done) return;
+        done = true;
+        timers.forEach(clearTimeout);
+        tu.onended = tu.onerror = tu.onplaying = null;
+        tu.pause();
+        if (speakDone.current === skip) speakDone.current = null;
+        resolve(ok);
+      };
+      const skip = () => finish(true);
+      speakDone.current = skip;
+      tu.onended = () => finish(true);
+      tu.onerror = () => finish(false);
+      // Watchdogs: must start within 8 s, and can't run much longer than the text needs.
+      timers.push(window.setTimeout(() => finish(false), 8000));
+      tu.onplaying = () => {
+        clearTimeout(timers[0]);
+        const words = text.split(/\s+/).length;
+        timers.push(window.setTimeout(() => finish(true), (words / 2 + 6) * 1000));
+      };
+      tu.src = `/api/tts?voice=${encodeURIComponent(tutorVoiceId)}&text=${encodeURIComponent(text)}`;
+      tu.play().catch(() => finish(false));
     });
 
-  const doAction = (res: Action, t: number) => {
-    const toks = track.tokens;
+  const doAction = (res: Action, { i, m, t, anchored }: Ctx) => {
+    const toks = trackFor(i, m).tokens;
     const ci = Math.max(0, tokenAt(toks, t));
     const [sa] = sentenceRange(toks, ci);
     switch (res.action) {
@@ -235,36 +349,75 @@ export function Player({ book }: { book: Book }) {
         // Back to the start of the sentence, but in long sentences only rewind ~4 s (to a word boundary).
         let k = sa;
         while (k < ci && t - (toks[k]?.s ?? 0) > 4) k++;
-        return go(sceneIdx, mode, (toks[k]?.s ?? 0) - 0.15, true);
+        return go(i, m, (toks[k]?.s ?? 0) - 0.15, true);
       }
       case "reread_sentence": {
         let start = sa;
-        if (sa > 0 && t - (toks[sa]?.s ?? 0) < 1.2) start = sentenceRange(toks, sa - 1)[0];
-        return go(sceneIdx, mode, (toks[start]?.s ?? 0) - 0.1, true);
+        if (!anchored && sa > 0 && t - (toks[sa]?.s ?? 0) < 1.2) start = sentenceRange(toks, sa - 1)[0];
+        return go(i, m, (toks[start]?.s ?? 0) - 0.1, true);
       }
       case "reread_scene":
-        return go(sceneIdx, mode, 0, true);
+        return go(i, m, 0, true);
       case "goto_scene": {
-        const i = Math.min(Math.max(0, res.sceneIndex ?? sceneIdx), book.scenes.length - 1);
-        return go(i, mode, 0, true);
+        const j = Math.min(Math.max(0, res.sceneIndex ?? i), book.scenes.length - 1);
+        return go(j, m, 0, true);
       }
       case "switch_simple":
       case "switch_original": {
-        const m: Mode = res.action === "switch_simple" ? "simple" : "orig";
+        const m2: Mode = res.action === "switch_simple" ? "simple" : "orig";
         const p = toks[ci]?.p ?? 0;
-        return go(sceneIdx, m, paragraphStart(scene[m].tokens, p), true);
+        return go(i, m2, paragraphStart(trackFor(i, m2).tokens, p), true);
       }
       default:
         setStatus("paused");
     }
   };
 
+  /** Sentence being read plus the ~2 sentences before it (crossing into the previous scene if needed). */
+  const heardContext = (i: number, m: Mode, t: number) => {
+    const toks = trackFor(i, m).tokens;
+    const ci = Math.max(0, tokenAt(toks, t));
+    const [sa, sb] = sentenceRange(toks, ci);
+    const before: string[] = [];
+    for (let k = sa - 1; before.length < 2 && k >= 0; ) {
+      const [a] = sentenceRange(toks, k);
+      before.unshift(joinTokens(toks, a, k));
+      k = a - 1;
+    }
+    if (before.length < 2 && i > 0) {
+      const pt = trackFor(i - 1, m).tokens;
+      const prev: string[] = [];
+      for (let k = pt.length - 1; prev.length < 2 - before.length && k >= 0; ) {
+        const [a] = sentenceRange(pt, k);
+        prev.unshift(joinTokens(pt, a, k));
+        k = a - 1;
+      }
+      before.unshift(...prev, "[new scene]");
+    }
+    return { recent: before.join(" "), current: joinTokens(toks, sa, sb) };
+  };
+
   const ask = async (q: string) => {
+    const t0 = pending.current?.t ?? narr.current?.currentTime ?? time;
     interrupt();
     unlockTutor();
     setPop(null);
+    setAudioIssue(false);
     const id = ++askSeq.current;
-    const t = pending.current?.t ?? narr.current?.currentTime ?? time;
+    let ctx: Ctx = { i: sceneIdx, m: mode, t: t0 };
+    let next: string | undefined;
+    // Just auto-advanced? The question is probably about the end of the previous scene:
+    // go back there (paused on its last sentence) so the listener sees what's being discussed.
+    const auto = lastAuto.current;
+    if (auto && auto.to === sceneIdx && t0 < BOUNDARY_SECS) {
+      const pt = trackFor(auto.from, mode).tokens;
+      const [la] = sentenceRange(pt, pt.length - 1);
+      const cur = track.tokens;
+      next = cur.length ? joinTokens(cur, 0, Math.max(0, tokenAt(cur, t0))) : undefined;
+      ctx = { i: auto.from, m: mode, t: pt[la]?.s ?? 0, anchored: true };
+      go(ctx.i, ctx.m, ctx.t, false);
+    }
+    const heard = { ...heardContext(ctx.i, ctx.m, ctx.t), next };
     const history = messages;
     setMessages((m) => [...m, { role: "user", content: q }]);
     setStatus("thinking");
@@ -273,7 +426,7 @@ export function Player({ book }: { book: Book }) {
       const r = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bookId: book.id, sceneIndex: sceneIdx, mode, time: t, question: q, history, lang }),
+        body: JSON.stringify({ bookId: book.id, sceneIndex: ctx.i, mode: ctx.m, time: ctx.t, question: q, history, lang, heard }),
       });
       res = await r.json();
       if (!res.reply) throw new Error("empty");
@@ -282,9 +435,14 @@ export function Player({ book }: { book: Book }) {
     }
     if (askSeq.current !== id || statusRef.current !== "thinking") return;
     setMessages((m) => [...m, { role: "assistant", content: res.reply }]);
-    await speak(res.reply);
+    const ok = await speak(res.reply);
     if (askSeq.current !== id || (statusRef.current as Status) !== "speaking") return; // user took over
-    doAction(res, t);
+    if (ok) return doAction(res, ctx);
+    // The voice didn't play (network / autoplay blocked): don't hang, wait for ▶ and then do the action.
+    tutor.current?.pause();
+    setAudioIssue(true);
+    setStatus("paused");
+    deferredAction.current = res.action === "stay_paused" ? null : () => doAction(res, ctx);
   };
 
   const skipTutor = () => {
@@ -354,15 +512,12 @@ export function Player({ book }: { book: Book }) {
     } catch {}
   };
 
-  const sayWord = async (w: string) => {
+  const sayWord = (w: string) => {
     unlockTutor();
-    try {
-      const r = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: w }) });
-      const tu = tutor.current!;
-      tu.onended = null;
-      tu.src = URL.createObjectURL(await r.blob());
-      await tu.play();
-    } catch {}
+    const tu = tutor.current!;
+    tu.onended = tu.onerror = tu.onplaying = null;
+    tu.src = `/api/tts?voice=${encodeURIComponent(tutorVoiceId)}&text=${encodeURIComponent(w)}`;
+    tu.play().catch(() => {});
   };
 
   // ---------- keyboard ----------
@@ -386,7 +541,12 @@ export function Player({ book }: { book: Book }) {
   const togglePlay = () => {
     const s = statusRef.current;
     if (s === "playing") pause();
-    else if (s === "finished") go(0, mode, 0, true);
+    else if (deferredAction.current) {
+      const run = deferredAction.current;
+      deferredAction.current = null;
+      setAudioIssue(false);
+      run();
+    } else if (s === "finished") go(0, mode, 0, true);
     else if (s === "listening") recorder.current?.stop();
     else if (s === "speaking" || s === "thinking") {
       askSeq.current++;
@@ -399,7 +559,7 @@ export function Player({ book }: { book: Book }) {
   const statusText: Record<Status, string> = {
     idle: "Press play to begin",
     playing: "Reading…",
-    paused: "Paused. Ask anything, or press play",
+    paused: audioIssue ? "Couldn't play Page's voice. Press ▶ to continue" : "Paused. Ask anything, or press play",
     listening: "Listening… tap the mic again to send",
     thinking: "Page is thinking…",
     speaking: "Page is answering",
@@ -516,11 +676,32 @@ export function Player({ book }: { book: Book }) {
                 ))}
               </select>
             </label>
+            <label className="flex items-center gap-1.5 rounded-full border border-ink/15 bg-white px-3 py-1.5">
+              <span className="text-ink-soft">Narrator</span>
+              <select value={narrator} onChange={(e) => changeNarrator(e.target.value)} className="bg-transparent font-bold outline-none">
+                {NARRATOR_VOICES.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.label} ({v.note})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5 rounded-full border border-ink/15 bg-white px-3 py-1.5">
+              <span className="text-ink-soft">Page&rsquo;s voice</span>
+              <select value={tutorVoice} onChange={(e) => setTutorVoice(e.target.value)} className="bg-transparent font-bold outline-none">
+                <option value="same">Same as narrator</option>
+                {NARRATOR_VOICES.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.label}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
 
           {!cinema && (
             <div className="mt-4 rounded-2xl border border-ink/10 bg-white/60 px-5 pt-5 pb-1">
-              <Transcript tokens={track.tokens} current={started ? current : -1} active={started} onWord={onWord} />
+              <Transcript tokens={track.tokens} current={started ? current : -1} active={started} onWord={onWord} onReadFrom={readFrom} />
             </div>
           )}
 
@@ -558,6 +739,7 @@ export function Player({ book }: { book: Book }) {
           onClose={() => setPop(null)}
           onSay={() => sayWord(pop.def?.word ?? pop.word)}
           onAsk={() => ask(`What does "${pop.word}" mean in this sentence: "${pop.sentence}"?`)}
+          onReadFrom={() => readFrom(pop.i)}
           onContinue={() => {
             setPop(null);
             go(sceneIdx, mode, sentenceStartTime(mode, narr.current?.currentTime ?? time) - 0.1, true);

@@ -36,8 +36,8 @@ export default function Home() {
             Books that read to you, show you, and <em className="text-accent">answer back</em>.
           </h1>
           <p className="mt-5 max-w-xl text-lg text-ink-soft">
-            Animate Books turns a book into an illustrated, narrated story with a friendly reading buddy you can interrupt at any moment. It&rsquo;s
-            made for people who find it hard to focus on a page and for anyone reading in a second language.
+            Animate Books turns a book into an illustrated, narrated story with a friendly reading buddy to ask questions to. It&rsquo;s
+            made for people who find it hard to focus or anyone reading in a second language.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Link href={`/read/${alice.id}`} className="rounded-full bg-accent px-6 py-3 font-bold text-white shadow-lg shadow-accent/25 hover:brightness-110">

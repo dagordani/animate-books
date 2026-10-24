@@ -12,6 +12,7 @@ export function WordPopover({
   onClose,
   onSay,
   onAsk,
+  onReadFrom,
   onContinue,
 }: {
   word: string;
@@ -21,6 +22,7 @@ export function WordPopover({
   onClose: () => void;
   onSay: () => void;
   onAsk: () => void;
+  onReadFrom: () => void;
   onContinue: () => void;
 }) {
   const width = 320;
@@ -68,15 +70,18 @@ export function WordPopover({
             <p className="italic text-ink-soft">“{def.example}”</p>
           </div>
         )}
-        <div className="mt-3 flex gap-2">
-          <button onClick={onAsk} className="flex-1 rounded-full border border-ink/15 px-3 py-1.5 text-sm hover:bg-paper-2">
+        <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+          <button onClick={onAsk} className="rounded-full border border-ink/15 px-3 py-1.5 hover:bg-paper-2">
             Ask Page more
+          </button>
+          <button onClick={onReadFrom} className="rounded-full border border-ink/15 px-3 py-1.5 hover:bg-paper-2" title="Continue the story from this word">
+            Read from here
           </button>
           <button
             onClick={onContinue}
-            className="flex flex-1 items-center justify-center gap-1 rounded-full bg-accent px-3 py-1.5 text-sm font-bold text-white hover:brightness-110"
+            className="col-span-2 flex items-center justify-center gap-1 rounded-full bg-accent px-3 py-1.5 font-bold text-white hover:brightness-110"
           >
-            <PlayIcon className="h-4 w-4" /> Continue
+            <PlayIcon className="h-4 w-4" /> Continue where I was
           </button>
         </div>
       </div>

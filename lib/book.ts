@@ -12,6 +12,18 @@ export type Track = {
   tokens: Token[];
 };
 
+/** Narration for one voice: same text/tokenization as the default track, different audio + timings. */
+export type VoiceTrack = Omit<Track, "paragraphs">;
+/** tracks/<voice>.json: sceneId -> mode -> track */
+export type VoiceTracks = Record<string, Record<Mode, VoiceTrack>>;
+
+export const NARRATOR_VOICES = [
+  { id: "fable", label: "Fable", note: "British storyteller" },
+  { id: "coral", label: "Coral", note: "bright & friendly" },
+  { id: "ash", label: "Ash", note: "calm & clear" },
+] as const;
+export const DEFAULT_NARRATOR = "fable";
+
 export type GlossaryItem = { word: string; meaning: string };
 
 export type Scene = {
@@ -77,4 +89,50 @@ export function paragraphStart(tokens: Token[], p: number): number {
 /** Strip punctuation for lookups / definitions. */
 export function cleanWord(w: string): string {
   return w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+}
+
+/** True if token i starts a sentence (or a paragraph). */
+export function isSentenceStart(tokens: Token[], i: number): boolean {
+  return i === 0 || tokens[i - 1].p !== tokens[i].p || SENTENCE_END.test(tokens[i - 1].t);
+}
+
+/** Text of whole sentences in [a, b] joined. */
+export function joinTokens(tokens: Token[], a: number, b: number): string {
+  return tokens
+    .slice(a, b + 1)
+    .map((x) => x.t)
+    .join(" ");
+}
+
+const BREAK_AFTER = /[,;:)—–]['"’”)]*$|[”"]$/;
+const BREAK_BEFORE = /^[(“"—]/;
+
+/**
+ * Subtitle-sized chunk of the sentence containing token i: at most ~maxWords / maxChars,
+ * preferably cut after punctuation (, ; : — ) ”) so long sentences become several short captions.
+ */
+export function captionRange(tokens: Token[], i: number, maxWords = 16, maxChars = 100): [number, number] {
+  const [sa, sb] = sentenceRange(tokens, i);
+  let a = sa;
+  while (a <= sb) {
+    let b = a;
+    let chars = 0;
+    let lastBreak = -1;
+    let overflow = false;
+    for (; b <= sb; b++) {
+      chars += tokens[b].t.length + 1;
+      if (b > a && (b - a + 1 > maxWords || chars > maxChars)) {
+        overflow = true;
+        break;
+      }
+      // A good place to cut: after punctuation, or before an opening bracket/quote/dash; keep >= 4 words per caption.
+      if (b < sb && b - a >= 3 && (BREAK_AFTER.test(tokens[b].t) || BREAK_BEFORE.test(tokens[b + 1].t))) lastBreak = b;
+    }
+    let end = overflow ? (lastBreak >= a ? lastBreak : b - 1) : sb;
+    // Avoid leaving a tiny orphan (< 4 words) at the end of the sentence.
+    if (overflow && sb - end < 4 && sb - a + 1 <= maxWords + 4) end = sb;
+    if (i <= end) return [a, end];
+    a = end + 1;
+  }
+  return [sa, sb];
 }

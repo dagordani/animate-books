@@ -12,7 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import OpenAI, { toFile } from "openai";
 import sharp from "sharp";
-import type { Book, Scene, Token, Track } from "../lib/book";
+import type { Book, Scene, Token, Track, VoiceTracks } from "../lib/book";
 
 const BOOK_ID = "alice";
 const SOURCE_URL = "https://www.gutenberg.org/cache/epub/11/pg11.txt";
@@ -22,7 +22,9 @@ const SCENE_CHARS = 1100;
 
 const LLM = process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
 const TTS = process.env.OPENAI_TTS_MODEL ?? "gpt-4o-mini-tts";
-const VOICE = process.env.OPENAI_VOICE ?? "fable";
+const VOICE = process.env.OPENAI_VOICE ?? "fable"; // default narrator, embedded in book.json
+// Extra narrator voices: timings go to tracks/<voice>.json, audio to audio/<voice>/.
+const EXTRA_VOICES = (process.env.EXTRA_VOICES ?? "coral,ash").split(",").filter(Boolean);
 const IMAGE = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1";
 
 const OUT = path.join(process.cwd(), "public", "books", BOOK_ID);
@@ -182,7 +184,7 @@ const norm = (s: string) =>
     .replace(/[’‘]/g, "'")
     .replace(/[^\p{L}\p{N}]/gu, "");
 
-async function narrate(paragraphs: string[], file: string, timingsFile: string, simple: boolean): Promise<Track> {
+async function narrate(paragraphs: string[], file: string, timingsFile: string, simple: boolean, voice = VOICE): Promise<Track> {
   const text = paragraphs.filter(Boolean).join("\n\n");
   if (!fs.existsSync(file)) {
     // TTS sometimes stops early on long inputs, so narrate paragraph by paragraph, check each
@@ -194,12 +196,12 @@ async function narrate(paragraphs: string[], file: string, timingsFile: string, 
       for (let attempt = 0; ; attempt++) {
         const speech = await openai.audio.speech.create({
           model: TTS,
-          voice: VOICE,
+          voice,
           input: para,
           response_format: "mp3",
           instructions: simple
             ? "You are a warm, patient storyteller reading to someone learning English. Speak clearly and a little slowly, with gentle expression and short pauses between sentences."
-            : "You are a warm, expressive audiobook narrator reading a classic children's story. Use a gentle British storytelling tone, give characters a little voice, and keep a calm, steady pace.",
+            : `You are a warm, expressive audiobook narrator reading a classic children's story. Use a gentle${voice === "fable" ? " British" : ""} storytelling tone, give characters a little voice, and keep a calm, steady pace.`,
         });
         fs.writeFileSync(part, Buffer.from(await speech.arrayBuffer()));
         const secs = probeDuration(part);
@@ -258,7 +260,7 @@ async function narrate(paragraphs: string[], file: string, timingsFile: string, 
   const r = (x: number) => Math.round(x * 100) / 100;
   return {
     paragraphs,
-    audio: `/books/${BOOK_ID}/audio/${path.basename(file)}`,
+    audio: "/" + path.relative(path.join(process.cwd(), "public"), file).split(path.sep).join("/"),
     duration: r(duration),
     tokens: tokens.map(({ t, s, e, p }) => ({ t, s: r(s), e: r(e), p })),
   };
@@ -392,6 +394,23 @@ async function main() {
   };
   fs.writeFileSync(`${OUT}/book.json`, JSON.stringify(book));
   console.log(`wrote ${OUT}/book.json`);
+
+  for (const voice of EXTRA_VOICES) {
+    for (const d of [`${OUT}/audio/${voice}`, `${OUT}/tracks`, `${CACHE}/${voice}`]) fs.mkdirSync(d, { recursive: true });
+    const tracks: VoiceTracks = {};
+    await pool(scenes, 4, async (sc) => {
+      console.log(`voice ${voice} ${sc.id}`);
+      const [orig, simple] = await Promise.all(
+        (["orig", "simple"] as const).map((m) =>
+          narrate(sc[m].paragraphs, `${OUT}/audio/${voice}/${sc.id}-${m}.mp3`, `${CACHE}/${voice}/${sc.id}-${m}.words.json`, m === "simple", voice),
+        ),
+      );
+      const strip = ({ audio, duration, tokens }: Track) => ({ audio, duration, tokens });
+      tracks[sc.id] = { orig: strip(orig), simple: strip(simple) };
+    });
+    fs.writeFileSync(`${OUT}/tracks/${voice}.json`, JSON.stringify(tracks));
+    console.log(`wrote tracks/${voice}.json`);
+  }
 }
 
 main().catch((e) => {

@@ -72,3 +72,9 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .kb, .fade-in, .title-card, .pulse-ring { animation: none !important; }
 }
+
+/* Sentence "read from here" markers: subtle, brighter on hover (always faintly visible on touch). */
+.sent-mark { opacity: 0.3; transition: opacity 150ms ease; }
+.transcript:hover .sent-mark { opacity: 0.55; }
+.sent-mark:hover, .sent-mark:focus-visible { opacity: 1; }
+@media (hover: none) { .sent-mark { opacity: 0.5; } }
