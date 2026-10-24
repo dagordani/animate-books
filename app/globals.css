@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+:root {
+  --paper: #fbf6ec;
+  --paper-2: #f3ead8;
+  --ink: #2b2118;
+  --ink-soft: #6b5d4f;
+  --accent: #b4532a;
+  --accent-soft: #f6dcc9;
+  --hl: #fcd97a;
+  --hl-soft: rgba(252, 217, 122, 0.32);
+  color-scheme: light;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-paper-2: var(--paper-2);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-hl: var(--hl);
+  --color-hl-soft: var(--hl-soft);
+  --font-sans: var(--font-ui);
+  --font-serif: var(--font-read);
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-ui), system-ui, sans-serif;
+}
+
+/* Scene crossfade */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.fade-in { animation: fade-in 1.4s ease both; }
+
+/* Ken Burns: four gentle pan/zoom paths, picked per scene */
+@keyframes kb0 { from { transform: scale(1.05) translate(0, 0); } to { transform: scale(1.22) translate(-3%, -2%); } }
+@keyframes kb1 { from { transform: scale(1.22) translate(3%, 1%); } to { transform: scale(1.05) translate(0, 0); } }
+@keyframes kb2 { from { transform: scale(1.08) translate(-3%, 2%); } to { transform: scale(1.2) translate(3%, -1%); } }
+@keyframes kb3 { from { transform: scale(1.18) translate(0, -3%); } to { transform: scale(1.06) translate(-2%, 2%); } }
+.kb { animation-timing-function: ease-in-out; animation-fill-mode: both; will-change: transform; }
+.kb-0 { animation-name: kb0; }
+.kb-1 { animation-name: kb1; }
+.kb-2 { animation-name: kb2; }
+.kb-3 { animation-name: kb3; }
+
+@keyframes title-card {
+  0% { opacity: 0; transform: translateY(8px); }
+  15%, 75% { opacity: 1; transform: none; }
+  100% { opacity: 0; }
+}
+.title-card { animation: title-card 4.5s ease both; }
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 rgba(180, 83, 42, 0.5); }
+  100% { box-shadow: 0 0 0 14px rgba(180, 83, 42, 0); }
+}
+.pulse-ring { animation: pulse-ring 1.2s ease-out infinite; }
+
+@keyframes dots { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
+.dot { animation: dots 1.2s infinite; }
+.dot:nth-child(2) { animation-delay: 0.15s; }
+.dot:nth-child(3) { animation-delay: 0.3s; }
+
+.word { transition: background-color 120ms ease, color 120ms ease; border-radius: 0.25em; }
+
+@media (prefers-reduced-motion: reduce) {
+  .kb, .fade-in, .title-card, .pulse-ring { animation: none !important; }
+}
