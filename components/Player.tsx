@@ -39,6 +39,7 @@ export function Player({ book }: { book: Book }) {
   const defCache = useRef(new Map<string, Definition>());
   const lastTok = useRef(-2);
   const tutorUnlocked = useRef(false);
+  const titled = useRef(new Set<string>()); // chapter title cards already shown
 
   const scene = book.scenes[sceneIdx];
   const track = scene[mode];
@@ -71,6 +72,10 @@ export function Player({ book }: { book: Book }) {
       localStorage.setItem(storeKey, JSON.stringify({ sceneIdx, mode, time, rate, lang, cinema }));
     } catch {}
   }, [storeKey, sceneIdx, mode, time, rate, lang, cinema]);
+
+  useEffect(() => {
+    if (time >= 5) titled.current.add(scene.id);
+  }, [time, scene.id]);
 
   // ---------- narration ----------
   useEffect(() => {
@@ -226,8 +231,12 @@ export function Player({ book }: { book: Book }) {
     const ci = Math.max(0, tokenAt(toks, t));
     const [sa] = sentenceRange(toks, ci);
     switch (res.action) {
-      case "resume":
-        return go(sceneIdx, mode, (toks[sa]?.s ?? 0) - 0.15, true);
+      case "resume": {
+        // Back to the start of the sentence, but in long sentences only rewind ~4 s (to a word boundary).
+        let k = sa;
+        while (k < ci && t - (toks[k]?.s ?? 0) > 4) k++;
+        return go(sceneIdx, mode, (toks[k]?.s ?? 0) - 0.15, true);
+      }
       case "reread_sentence": {
         let start = sa;
         if (sa > 0 && t - (toks[sa]?.s ?? 0) < 1.2) start = sentenceRange(toks, sa - 1)[0];
@@ -400,21 +409,34 @@ export function Player({ book }: { book: Book }) {
   return (
     <main className="mx-auto max-w-7xl px-4 py-4 lg:py-6">
       <header className="mb-4 flex items-center justify-between gap-4">
-        <Link href="/" className="text-sm text-ink-soft hover:text-accent">
+        <Link href="/" className="shrink-0 text-sm whitespace-nowrap text-ink-soft hover:text-accent">
           ← Animate Books
         </Link>
         <div className="min-w-0 text-right">
           <div className="truncate font-serif text-lg leading-tight">{book.title}</div>
-          <div className="text-xs text-ink-soft">
+          <div className="truncate text-xs text-ink-soft">
             Chapter {scene.chapter}: {scene.chapterTitle} · part {sceneIdx + 1} of {book.scenes.length}
           </div>
         </div>
       </header>
 
-      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
         <section className="min-w-0">
-          <Stage scene={scene} playing={playing} duration={track.duration} showTitle={isChapterStart && time < 5}>
+          <Stage scene={scene} playing={playing} duration={track.duration} showTitle={started && isChapterStart && time < 5 && !titled.current.has(scene.id)}>
             {cinema && started && <Caption tokens={track.tokens} current={current} onWord={onWord} />}
+            {(status === "thinking" || status === "speaking" || status === "listening") && (
+              <div className="absolute inset-x-3 top-3 flex justify-center sm:inset-x-6 sm:top-5">
+                <div className="fade-in max-w-xl rounded-2xl bg-white/95 px-4 py-3 text-[0.95rem] leading-snug shadow-xl">
+                  <span className="mr-1.5 font-bold text-accent">Page:</span>
+                  {status === "listening" ? "I'm listening…" : status === "thinking" ? "Hmm, let me think…" : messages[messages.length - 1]?.content}
+                  {status === "speaking" && (
+                    <button onClick={skipTutor} className="ml-2 text-xs text-accent underline">
+                      skip
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
             {!started && (
               <button onClick={play} className="absolute inset-0 grid place-items-center" aria-label="Play">
                 <span className="grid h-20 w-20 place-items-center rounded-full bg-white/90 text-accent shadow-xl transition hover:scale-105">

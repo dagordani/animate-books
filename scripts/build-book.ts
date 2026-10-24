@@ -185,20 +185,34 @@ const norm = (s: string) =>
 async function narrate(paragraphs: string[], file: string, timingsFile: string, simple: boolean): Promise<Track> {
   const text = paragraphs.filter(Boolean).join("\n\n");
   if (!fs.existsSync(file)) {
-    const speech = await openai.audio.speech.create({
-      model: TTS,
-      voice: VOICE,
-      input: text,
-      response_format: "mp3",
-      instructions: simple
-        ? "You are a warm, patient storyteller reading to someone learning English. Speak clearly and a little slowly, with gentle expression and short pauses between sentences."
-        : "You are a warm, expressive audiobook narrator reading a classic children's story. Use a gentle British storytelling tone, give characters a little voice, and keep a calm, steady pace.",
-    });
-    const tmp = `${file}.tmp.mp3`;
-    fs.writeFileSync(tmp, Buffer.from(await speech.arrayBuffer()));
+    // TTS sometimes stops early on long inputs, so narrate paragraph by paragraph, check each
+    // clip's length against its word count, then join them with a short pause.
+    const parts: string[] = [];
+    for (const [i, para] of paragraphs.filter(Boolean).entries()) {
+      const part = `${file}.${i}.tmp.mp3`;
+      const minSecs = para.split(/\s+/).length / 4.5;
+      for (let attempt = 0; ; attempt++) {
+        const speech = await openai.audio.speech.create({
+          model: TTS,
+          voice: VOICE,
+          input: para,
+          response_format: "mp3",
+          instructions: simple
+            ? "You are a warm, patient storyteller reading to someone learning English. Speak clearly and a little slowly, with gentle expression and short pauses between sentences."
+            : "You are a warm, expressive audiobook narrator reading a classic children's story. Use a gentle British storytelling tone, give characters a little voice, and keep a calm, steady pace.",
+        });
+        fs.writeFileSync(part, Buffer.from(await speech.arrayBuffer()));
+        const secs = probeDuration(part);
+        if (secs >= minSecs || attempt >= 3) break;
+        console.log(`    TTS clip too short (${secs.toFixed(1)}s < ${minSecs.toFixed(1)}s), retrying`);
+      }
+      parts.push(part);
+    }
+    const inputs = parts.flatMap((p) => ["-i", p]);
+    const filter = parts.map((_, i) => `[${i}:a]apad=pad_dur=0.45[a${i}];`).join("") + parts.map((_, i) => `[a${i}]`).join("") + `concat=n=${parts.length}:v=0:a=1[out]`;
     // Mono 48 kbps is plenty for speech and keeps the repo/deploy small.
-    execFileSync("ffmpeg", ["-y", "-loglevel", "error", "-i", tmp, "-ac", "1", "-b:a", "48k", file]);
-    fs.unlinkSync(tmp);
+    execFileSync("ffmpeg", ["-y", "-loglevel", "error", ...inputs, "-filter_complex", filter, "-map", "[out]", "-ac", "1", "-b:a", "48k", file]);
+    parts.forEach((p) => fs.unlinkSync(p));
   }
 
   let words: { word: string; start: number; end: number }[];
@@ -206,19 +220,52 @@ async function narrate(paragraphs: string[], file: string, timingsFile: string, 
   if (fs.existsSync(timingsFile)) {
     ({ words, duration } = JSON.parse(fs.readFileSync(timingsFile, "utf8")));
   } else {
-    const tr = await openai.audio.transcriptions.create({
-      file: await toFile(fs.readFileSync(file), path.basename(file), { type: "audio/mpeg" }),
-      model: "whisper-1",
-      response_format: "verbose_json",
-      timestamp_granularities: ["word"],
-      prompt: text.slice(0, 800),
-    });
-    words = (tr.words ?? []).map((w) => ({ word: w.word, start: w.start, end: w.end }));
-    duration = tr.duration;
+    const expected = text.split(/\s+/).length;
+    // Whisper occasionally truncates long clips; retry with/without a prompt until most words come back.
+    // Whisper occasionally truncates or hallucinates; try a few strategies and keep the one that aligns best.
+    let best = { words: [] as typeof words, duration: 0, matched: -1 };
+    const strategies: (string | undefined | "chunked")[] = [text.slice(0, 800), undefined, "A story read aloud.", "chunked"];
+    for (const strat of strategies) {
+      let w: typeof words;
+      let d = best.duration;
+      if (strat === "chunked") {
+        console.log(`    transcribing ${path.basename(file)} in chunks`);
+        w = await transcribeChunked(file);
+        d = d || probeDuration(file);
+      } else {
+        const tr = await openai.audio.transcriptions.create({
+          file: await toFile(fs.readFileSync(file), path.basename(file), { type: "audio/mpeg" }),
+          model: "whisper-1",
+          response_format: "verbose_json",
+          timestamp_granularities: ["word"],
+          ...(strat ? { prompt: strat } : {}),
+        });
+        w = (tr.words ?? []).map((x) => ({ word: x.word, start: x.start, end: x.end }));
+        d = tr.duration;
+      }
+      const { matched } = align(paragraphs, w);
+      if (matched > best.matched) best = { words: w, duration: d, matched };
+      if (matched >= expected * 0.9) break;
+      console.log(`    retrying transcription of ${path.basename(file)} (aligned ${matched}/${expected})`);
+    }
+    ({ words, duration } = best);
     fs.writeFileSync(timingsFile, JSON.stringify({ words, duration }));
   }
 
-  // Align displayed tokens (with punctuation) to transcribed words.
+  const { tokens, matched } = align(paragraphs, words);
+  console.log(`    aligned ${matched}/${tokens.length} tokens`);
+
+  const r = (x: number) => Math.round(x * 100) / 100;
+  return {
+    paragraphs,
+    audio: `/books/${BOOK_ID}/audio/${path.basename(file)}`,
+    duration: r(duration),
+    tokens: tokens.map(({ t, s, e, p }) => ({ t, s: r(s), e: r(e), p })),
+  };
+}
+
+/** Align displayed tokens (with punctuation) to transcribed words; unmatched tokens are interpolated. */
+function align(paragraphs: string[], words: { word: string; start: number; end: number }[]) {
   const tokens: (Token & { ok: boolean })[] = [];
   paragraphs.forEach((para, p) =>
     para
@@ -254,15 +301,29 @@ async function narrate(paragraphs: string[], file: string, timingsFile: string, 
     tokens[i].e = next ? next.s : prev ? prev.e + 0.3 : 0.3;
   }
   const matched = tokens.filter((t) => t.ok).length;
-  console.log(`    aligned ${matched}/${tokens.length} tokens`);
+  return { tokens, matched };
+}
 
-  const r = (x: number) => Math.round(x * 100) / 100;
-  return {
-    paragraphs,
-    audio: `/books/${BOOK_ID}/audio/${path.basename(file)}`,
-    duration: r(duration),
-    tokens: tokens.map(({ t, s, e, p }) => ({ t, s: r(s), e: r(e), p })),
-  };
+/** Fallback for clips Whisper truncates: transcribe fixed 15 s chunks and offset their timestamps. */
+async function transcribeChunked(file: string, seg = 15) {
+  const dir = fs.mkdtempSync(path.join(CACHE, "chunks-"));
+  execFileSync("ffmpeg", ["-loglevel", "error", "-i", file, "-f", "segment", "-segment_time", String(seg), "-ac", "1", "-b:a", "48k", `${dir}/%03d.mp3`]);
+  const out: { word: string; start: number; end: number }[] = [];
+  for (const [i, f] of fs.readdirSync(dir).sort().entries()) {
+    const tr = await openai.audio.transcriptions.create({
+      file: await toFile(fs.readFileSync(`${dir}/${f}`), f, { type: "audio/mpeg" }),
+      model: "whisper-1",
+      response_format: "verbose_json",
+      timestamp_granularities: ["word"],
+    });
+    for (const w of tr.words ?? []) out.push({ word: w.word, start: w.start + i * seg, end: w.end + i * seg });
+  }
+  fs.rmSync(dir, { recursive: true });
+  return out;
+}
+
+function probeDuration(file: string) {
+  return Number(execFileSync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file]).toString().trim());
 }
 
 // ---------- main ----------

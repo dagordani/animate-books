@@ -41,12 +41,12 @@ export function Transcript({
             const inSentence = i >= sa && i <= sb;
             const future = active && current >= 0 && i > sb;
             return (
-              <span key={i}>
+              <span key={i} className={inSentence && i < sb ? "bg-hl-soft" : ""}>
                 <span
                   data-i={i}
                   onClick={(e) => onWord(i, e.currentTarget)}
                   className={`word cursor-pointer px-[0.06em] hover:underline hover:decoration-accent/50 ${
-                    isCur ? "bg-hl text-ink" : inSentence ? "bg-hl-soft" : future ? "text-ink/45" : ""
+                    isCur ? "bg-hl text-ink" : i === sb ? "bg-hl-soft" : future ? "text-ink/45" : ""
                   }`}
                 >
                   {tokens[i].t}

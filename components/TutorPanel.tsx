@@ -25,8 +25,11 @@ export function TutorPanel({
   onSkip: () => void;
 }) {
   const [text, setText] = useState("");
-  const end = useRef<HTMLDivElement>(null);
-  useEffect(() => end.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }), [messages, status]);
+  const list = useRef<HTMLDivElement>(null);
+  // Scroll only the chat box (scrollIntoView would also scroll the page on mobile).
+  useEffect(() => {
+    list.current?.scrollTo({ top: list.current.scrollHeight, behavior: "smooth" });
+  }, [messages, status]);
   const busy = status === "thinking" || status === "listening";
 
   const submit = (q: string) => {
@@ -45,7 +48,7 @@ export function TutorPanel({
         </div>
       </header>
 
-      <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3">
+      <div ref={list} className="max-h-[50vh] flex-1 space-y-3 overflow-y-auto px-4 py-3 lg:max-h-none">
         {messages.length === 0 && (
           <div className="space-y-3 text-sm text-ink-soft">
             <p>
@@ -80,7 +83,6 @@ export function TutorPanel({
             Skip and continue
           </button>
         )}
-        <div ref={end} />
       </div>
 
       {glossary.length > 0 && (
