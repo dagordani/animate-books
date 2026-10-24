@@ -1,13 +1,27 @@
 import { NextResponse } from "next/server";
 import { BOOKS } from "@/lib/books";
 import { sentenceText, tokenAt, type Mode } from "@/lib/book";
-import { LLM, openai } from "@/lib/openai";
+import { TUTOR_AGENT_MODEL, TUTOR_AGENT_SPEND_LIMIT_CENTS, openai } from "@/lib/openai";
 
 export const runtime = "nodejs";
+// Agent runs can include research and sandbox work; Vercel supports this App
+// Router setting for the route's serverless invocation.
+export const maxDuration = 180;
 
 type Msg = { role: "user" | "assistant"; content: string };
 
 const ACTIONS = ["resume", "reread_sentence", "reread_scene", "goto_scene", "switch_simple", "switch_original", "stay_paused"] as const;
+
+const tutorSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["reply", "action", "sceneIndex"],
+  properties: {
+    reply: { type: "string" },
+    action: { type: "string", enum: [...ACTIONS] },
+    sceneIndex: { type: ["integer", "null"] },
+  },
+};
 
 export async function POST(req: Request) {
   const { bookId, sceneIndex, mode, time, question, history = [], lang, heard } = (await req.json()) as {
@@ -35,7 +49,7 @@ export async function POST(req: Request) {
   const sceneList = book.scenes.map((s) => `#${s.index} (ch.${s.chapter}) ${s.summary}`).join("\n");
 
   const system = `You are Page, a warm, encouraging reading companion inside an app that narrates "${book.title}" by ${book.author} with illustrations.
-The listener paused the narration to talk to you. Your reply will be SPOKEN aloud, so:
+The listener paused the narration to talk to you. You have a managed sandbox and web search: use them when they would make an answer more accurate or useful. You may investigate, write code, and run small experiments before answering, but never mention your private work or tools to the listener. Your reply will be SPOKEN aloud, so:
 - Keep it short: 1-3 sentences (max ~60 words). No lists, no markdown, no emojis.
 - Use simple, friendly English. ${lang && lang !== "English" ? `The listener's native language is ${lang}: when explaining a word or idea, also give the ${lang} translation, and answer fully in ${lang} if they write in ${lang}.` : ""}
 - Stay about the book. If asked something off-topic, kindly steer back to the story in one sentence (action "stay_paused").
@@ -67,34 +81,40 @@ WHAT THE LISTENER JUST HEARD (oldest first; "[new scene]" marks a scene change):
 ${heard?.recent ? heard.recent.slice(0, 2000) + "\n" : ""}>>> "${current}"   <-- sentence they were on when they paused${heard?.next ? `\n(After that, the narrator had just started the next scene: "${heard.next.slice(0, 400)}")` : ""}`;
 
   try {
-    const res = await openai.chat.completions.create({
-      model: LLM,
-      temperature: 0.5,
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "tutor",
-          strict: true,
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            required: ["reply", "action", "sceneIndex"],
-            properties: {
-              reply: { type: "string" },
-              action: { type: "string", enum: [...ACTIONS] },
-              sceneIndex: { type: ["integer", "null"] },
-            },
-          },
-        },
+    const input = [
+      context,
+      "RECENT CONVERSATION:",
+      ...history.slice(-8).map((m) => `${m.role.toUpperCase()}: ${String(m.content).slice(0, 1000)}`),
+      `LISTENER'S QUESTION: ${question.slice(0, 1000)}`,
+      "Return only the JSON object that matches the requested schema.",
+    ].join("\n\n");
+    const stream = await openai.beta.agents.sessions.create({
+      stream: true,
+      environment: {
+        type: "openai_hosted",
+        network: { access: "enabled" },
       },
-      messages: [
-        { role: "system", content: system },
-        { role: "system", content: context },
-        ...history.slice(-8).map((m) => ({ role: m.role, content: String(m.content).slice(0, 1000) })),
-        { role: "user", content: question.slice(0, 1000) },
-      ],
+      spend_control: { limit: TUTOR_AGENT_SPEND_LIMIT_CENTS },
+      agent: {
+        model: TUTOR_AGENT_MODEL,
+        instructions: system,
+        reasoning: { effort: "medium" },
+        text: { verbosity: "low", format: { type: "json_schema", schema: tutorSchema } },
+        tools: [{ type: "web_search" }, { type: "programmatic_tool_calling" }],
+        multi_agent: { enabled: true, max_concurrent_subagents: 2 },
+      },
+      input,
     });
-    return NextResponse.json(JSON.parse(res.choices[0].message.content!));
+    const result = await stream.finalResult();
+    try {
+      return NextResponse.json(JSON.parse(result.output_text));
+    } finally {
+      // Each request currently creates an ephemeral session, so retain neither
+      // the conversation nor its hosted sandbox after its final answer.
+      await openai.beta.agents.sessions.delete(result.session_id).catch((error) => {
+        console.error("Failed to delete completed tutor agent session", error);
+      });
+    }
   } catch (e) {
     console.error(e);
     return NextResponse.json({ reply: "Sorry, I lost my place for a second. Could you ask me again?", action: "stay_paused", sceneIndex: null });
