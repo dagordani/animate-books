@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { BOOKS } from "@/lib/books";
 import { sentenceText, tokenAt, type Mode } from "@/lib/book";
-import { TUTOR_AGENT_MODEL, TUTOR_AGENT_SPEND_LIMIT_CENTS, openai } from "@/lib/openai";
+import { TUTOR_AGENT_MODEL, openai } from "@/lib/openai";
 
 export const runtime = "nodejs";
 // Agent runs can include research and sandbox work; Vercel supports this App
@@ -94,7 +94,6 @@ ${heard?.recent ? heard.recent.slice(0, 2000) + "\n" : ""}>>> "${current}"   <--
         type: "openai_hosted",
         network: { access: "enabled" },
       },
-      spend_control: { limit: TUTOR_AGENT_SPEND_LIMIT_CENTS },
       agent: {
         model: TUTOR_AGENT_MODEL,
         instructions: system,
